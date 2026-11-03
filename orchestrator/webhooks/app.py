@@ -1,25 +1,31 @@
-"""GitHub webhook receiver. Verify, store (de-duplicated), reply immediately, then route.
+"""GitHub webhook receiver. Verify, store (de-duplicated), reply. Nothing else.
 
-If routing fails the event stays unprocessed in `events_inbox` and the reconciler replays it.
+Webhooks are only nudges: the reconciler picks stored events up within seconds and re-reads the
+real state from GitHub, so a lost, late or duplicated event never changes the outcome, only the
+latency. This process needs nothing but Postgres.
 Run: uvicorn orchestrator.webhooks.app:app --host 0.0.0.0 --port 8000
 """
 
 import hashlib
 import hmac
 import json
-import logging
 from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
-from temporalio.client import Client
+from fastapi import FastAPI, Header, HTTPException, Request
 
 from core.db import close_pool, get_pool
 from core.settings import get_settings
 from orchestrator import state
-from orchestrator.webhooks.router import route
 
-log = logging.getLogger(__name__)
-HANDLED_EVENTS = {"issues", "pull_request"}
+HANDLED_EVENTS = {
+    "issues",
+    "issue_comment",
+    "pull_request",
+    "pull_request_review",
+    "check_suite",
+    "check_run",
+    "status",
+}
 
 
 def valid_signature(secret: str, body: bytes, signature: str | None) -> bool:
@@ -31,9 +37,7 @@ def valid_signature(secret: str, body: bytes, signature: str | None) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    s = get_settings()
     await get_pool()
-    app.state.temporal = await Client.connect(s.temporal_address, namespace=s.temporal_namespace)
     yield
     await close_pool()
 
@@ -41,20 +45,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 
-async def process(client: Client, delivery_id: str, event: str, payload: dict) -> None:
-    try:
-        outcome = await route(client, event, payload)
-        log.info("delivery %s (%s.%s): %s", delivery_id, event, payload.get("action"), outcome)
-        await state.mark_event(delivery_id)
-    except Exception as e:  # noqa: BLE001 - left unprocessed for the reconciler
-        log.exception("routing delivery %s failed", delivery_id)
-        await state.mark_event(delivery_id, error=f"{type(e).__name__}: {e}")
-
-
 @app.post("/webhooks/github", status_code=202)
 async def github_webhook(
     request: Request,
-    background: BackgroundTasks,
     x_github_event: str = Header(...),
     x_github_delivery: str = Header(...),
     x_hub_signature_256: str | None = Header(None),
@@ -64,11 +57,8 @@ async def github_webhook(
         raise HTTPException(status_code=401, detail="bad signature")
     if x_github_event not in HANDLED_EVENTS:
         return {"status": "ignored"}
-    payload = json.loads(body)
-    if not await state.store_event(x_github_delivery, x_github_event, payload):
-        return {"status": "duplicate"}
-    background.add_task(process, request.app.state.temporal, x_github_delivery, x_github_event, payload)
-    return {"status": "accepted"}
+    stored = await state.store_event(x_github_delivery, x_github_event, json.loads(body))
+    return {"status": "accepted" if stored else "duplicate"}
 
 
 @app.get("/healthz")

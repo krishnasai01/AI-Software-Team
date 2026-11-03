@@ -1,15 +1,11 @@
-"""Entry point inside a sandbox: `python -m agents.runner < task.json`.
+"""Entry point inside a sandbox: `python -m agents.runner`.
 
-Clones the repo, runs one agent session for the task's role, and (for the engineer) pushes the
-branch if the final diff is clean of protected paths. Always prints exactly one
-`AGENT_RESULT <json>` line, even on failure.
-
-The GitHub token arrives on stdin, is held only in this process's memory, and reaches git through
-`-c http.extraheader`, so it is never written to .git/config or to any environment the agent sees.
+Reads /task/task.json and /task/repo.bundle, runs one agent session, and writes /out/result.json
+(plus /out/result.bundle with any new commits). It holds no GitHub credentials and pushes nothing:
+the worker treats everything in /out as untrusted and verifies it before acting on it.
 """
 
 import asyncio
-import base64
 import importlib
 import json
 import subprocess
@@ -19,26 +15,20 @@ from pathlib import Path
 
 import yaml
 
-from agents._shared.guards import WORKSPACE, protected_paths_touched
+from agents._shared.guards import WORKSPACE
 from core.model import AgentSession, run_agent
 
 AGENTS_DIR = Path(__file__).parent
-RESULT_MARKER = "AGENT_RESULT "
+TASK_DIR = Path("/task")
+OUT_DIR = Path("/out")
+RESULT_REF = "refs/heads/agent-result"
 
 
-class Git:
-    def __init__(self, token: str, cwd: str = WORKSPACE):
-        auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-        self.auth = ["-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {auth}"]
-        self.cwd = cwd
-
-    def __call__(self, *args: str, auth: bool = False, check: bool = True) -> str:
-        cmd = ["git", *(self.auth if auth else []), *args]
-        p = subprocess.run(cmd, cwd=self.cwd, capture_output=True, text=True)
-        if check and p.returncode != 0:
-            # Never echo the command: it may hold the auth header.
-            raise RuntimeError(f"git {args[0]} failed: {p.stderr.strip()[-500:]}")
-        return p.stdout.strip()
+def git(*args: str, cwd: str | None = None) -> str:
+    p = subprocess.run(["git", *args], cwd=cwd or WORKSPACE, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"git {args[0]} failed: {p.stderr.strip()[-500:]}")
+    return p.stdout.strip()
 
 
 def load_role(role: str) -> tuple[dict, str]:
@@ -47,104 +37,87 @@ def load_role(role: str) -> tuple[dict, str]:
     return config, prompt
 
 
-def product_brain(workspace: str = WORKSPACE) -> str:
-    brain_dir = Path(workspace) / "docs" / "brain"
-    if not brain_dir.is_dir():
-        return ""
-    parts = [f"## {p.name}\n\n{p.read_text()}" for p in sorted(brain_dir.glob("*.md"))]
-    return "\n\n# Product brain\n\n" + "\n\n".join(parts)
-
-
 def untrusted(tag: str, text: str) -> str:
     return f'<{tag} trust="untrusted">\n{text}\n</{tag}>'
 
 
 def build_prompt(task: dict) -> str:
-    t = task["ticket"]
+    t, ctx, role, mode = task["ticket"], task.get("context") or {}, task["role"], task["mode"]
     lines = [
-        f"Repository: {task['repo']}  Base branch: {task['base_branch']}",
+        f"Repository: {task['repo']}. Base branch: `base`. Mode: **{mode}**.",
         f"Ticket #{t['number']}: {t['title']}",
         untrusted("ticket", t.get("body") or "(no description)"),
     ]
-    if task["role"] == "engineer":
-        lines.append(f"You are on branch `{task['branch']}`. Commit your work there; do not push.")
-        if task.get("feedback"):
-            lines.append("This is a rework round. The reviewer requested these changes:")
-            lines.append(untrusted("review_feedback", task["feedback"]))
-    else:
+    if task.get("memories"):
+        lines.append("Notes from earlier work on this product (decisions and answers):")
+        lines.append(untrusted("memories", "\n".join(f"- {m}" for m in task["memories"])))
+    if role == "engineer":
+        lines.append("You are on branch `work`. Commit your work there.")
+        if ctx.get("guidance"):
+            lines.append("Guidance from the tech lead or the owner:")
+            lines.append(untrusted("guidance", ctx["guidance"]))
+        if ctx.get("feedback"):
+            lines.append("Review feedback to address:")
+            lines.append(untrusted("review_feedback", ctx["feedback"]))
+        if ctx.get("ci_failures"):
+            lines.append("Failing CI checks: " + ", ".join(ctx["ci_failures"]))
+    elif role == "reviewer":
         pr = task["pr"]
-        lines.append(f"Review PR #{pr['number']}: diff with `git diff origin/{task['base_branch']}...HEAD`.")
+        lines.append(f"Review PR #{pr['number']}: the change is `git diff base...HEAD`.")
         lines.append(untrusted("pr_description", pr.get("body") or ""))
-        lines.append(f"CI status: {task.get('ci_summary', 'unknown')}")
+        lines.append(f"CI status: {ctx.get('ci', 'unknown')}")
+    else:  # techlead
+        for key in ("reason", "questions", "review_history", "engineer_summary"):
+            if ctx.get(key):
+                value = ctx[key] if isinstance(ctx[key], str) else json.dumps(ctx[key], indent=2)
+                lines.append(f"{key.replace('_', ' ').capitalize()}:")
+                lines.append(untrusted(key, value))
     lines.append("Finish by returning the structured result.")
     return "\n\n".join(lines)
 
 
-def prepare_workspace(task: dict, git: Git) -> str:
-    """Clone and check out the right ref. Returns the starting commit sha."""
+def prepare_workspace(task: dict) -> str:
+    """Clone from the bundle and check out `work`. Returns the starting commit."""
     Path(WORKSPACE).mkdir(parents=True, exist_ok=True)
-    git("clone", "--quiet", "--no-tags", f"https://github.com/{task['repo']}.git", ".", auth=True)
+    git("clone", "--quiet", "--no-tags", str(TASK_DIR / "repo.bundle"), ".")
+    git("checkout", "--quiet", "-B", "work", "origin/work")
+    git("branch", "--quiet", "-f", "base", "origin/base")
+    git("remote", "remove", "origin")  # nothing to fetch from or push to
     author = task.get("git_author") or {}
     git("config", "user.name", author.get("name", f"agent-company {task['role']}"))
     git("config", "user.email", author.get("email", "agents@localhost"))
-    if task["role"] == "engineer":
-        branch = task["branch"]
-        remote = git("ls-remote", "--heads", "origin", branch, auth=True)
-        if remote:
-            git("fetch", "--quiet", "origin", branch, auth=True)
-            git("checkout", "--quiet", "-b", branch, f"origin/{branch}")
-        else:
-            git("checkout", "--quiet", "-b", branch, f"origin/{task['base_branch']}")
-    else:
-        number = task["pr"]["number"]
-        git("fetch", "--quiet", "origin", f"pull/{number}/head:pr-{number}", auth=True)
-        git("checkout", "--quiet", f"pr-{number}")
     return git("rev-parse", "HEAD")
 
 
-def finish_engineer(task: dict, git: Git, start_sha: str, structured: dict | None) -> dict:
+def export_commits(start_sha: str) -> dict:
     head = git("rev-parse", "HEAD")
-    dirty = git("status", "--porcelain")
+    dirty = bool(git("status", "--porcelain"))
     if head == start_sha:
-        return {"pushed": False, "head_sha": head, "note": "no new commits", "dirty": bool(dirty)}
-    changed = git("diff", "--name-only", f"origin/{task['base_branch']}...HEAD").splitlines()
-    touched = protected_paths_touched(changed)
-    if touched:
-        return {
-            "pushed": False,
-            "head_sha": head,
-            "blocked_paths": touched,
-            "note": "diff touches protected paths; not pushed",
-        }
-    if structured and structured.get("status") == "blocked":
-        return {"pushed": False, "head_sha": head, "note": "agent reported blocked; not pushed"}
-    git("push", "--quiet", "origin", f"HEAD:refs/heads/{task['branch']}", auth=True)
-    return {"pushed": True, "head_sha": head, "changed_files": changed, "dirty": bool(dirty)}
+        return {"committed": False, "head_sha": head, "dirty": dirty}
+    git("update-ref", RESULT_REF, head)
+    git("bundle", "create", "--quiet", str(OUT_DIR / "result.bundle"), RESULT_REF, f"^{start_sha}")
+    return {"committed": True, "head_sha": head, "dirty": dirty}
 
 
 async def main(task: dict) -> dict:
-    secrets = task.pop("secrets")
-    git = Git(secrets["github_token"])
     role = task["role"]
     config, role_prompt = load_role(role)
     hooks = importlib.import_module(f"agents.{role}.hooks")
-
-    start_sha = prepare_workspace(task, git)
+    start_sha = prepare_workspace(task)
     outcome = await run_agent(
         AgentSession(
             prompt=build_prompt(task),
-            system_prompt=role_prompt + product_brain(),
+            instructions=role_prompt + "\n\n" + (task.get("instructions") or ""),
             model=config["model"],
             cwd=WORKSPACE,
             allowed_tools=config["tools"],
             max_turns=config["max_turns"],
-            max_budget_usd=min(config["max_budget_usd_per_run"], task.get("budget_remaining_usd", 1e9)),
+            max_budget_usd=min(config["max_budget_usd_per_run"], task.get("budget_usd", 1e9)),
             output_schema=config.get("output_schema"),
             pre_tool_use=hooks.pre_tool_use,
-            mcp_servers=config.get("mcp_servers") or {},
             env={
-                "ANTHROPIC_BASE_URL": secrets["model_base_url"],
-                "ANTHROPIC_API_KEY": secrets["model_api_key"],
+                "ANTHROPIC_BASE_URL": task["model"]["base_url"],
+                "ANTHROPIC_AUTH_TOKEN": task["model"]["api_key"],
                 "ANTHROPIC_CUSTOM_HEADERS": f"langfuse_trace_id: {task['run_id']}",
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                 "DISABLE_AUTOUPDATER": "1",
@@ -153,33 +126,37 @@ async def main(task: dict) -> dict:
     )
     result = {
         "run_id": task["run_id"],
-        "outcome": "completed" if outcome.ok else outcome.subtype,
-        "output": outcome.structured,
-        "text": outcome.text,
+        "subtype": outcome.subtype,
+        "ok": outcome.ok,
+        "output": outcome.structured if isinstance(outcome.structured, dict) else None,
+        "text": (outcome.text or "")[:4000],
         "turns": outcome.turns,
         "cost_usd": outcome.cost_usd,
         "tokens_in": outcome.tokens_in,
         "tokens_out": outcome.tokens_out,
         "errors": outcome.errors,
+        "denials": outcome.denials,
+        "start_sha": start_sha,
     }
     if role == "engineer":
-        result["git"] = finish_engineer(task, git, start_sha, outcome.structured)
-        if outcome.ok and isinstance(outcome.structured, dict) and outcome.structured.get("status") == "blocked":
-            result["outcome"] = "blocked"
-        elif result["git"].get("blocked_paths"):
-            result["outcome"] = "blocked"
+        result.update(export_commits(start_sha))
     return result
 
 
 def cli() -> None:
-    task = json.loads(sys.stdin.read())
+    task = json.loads((TASK_DIR / "task.json").read_text())
     try:
         result = asyncio.run(main(task))
-    except Exception as e:  # noqa: BLE001 - the worker must always get a result line
+    except Exception as e:  # noqa: BLE001 - the worker must always get a result
         traceback.print_exc(file=sys.stderr)
-        result = {"run_id": task.get("run_id"), "outcome": "error", "errors": [f"{type(e).__name__}: {e}"]}
-    sys.stdout.write(RESULT_MARKER + json.dumps(result, default=str) + "\n")
-    sys.stdout.flush()
+        result = {
+            "run_id": task.get("run_id"),
+            "subtype": "runner_error",
+            "ok": False,
+            "errors": [f"{type(e).__name__}: {e}"],
+        }
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUT_DIR / "result.json").write_text(json.dumps(result, default=str))
 
 
 if __name__ == "__main__":

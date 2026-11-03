@@ -1,7 +1,7 @@
 [project]
 name = "agent-company"
 version = "0.1.0"
-description = "An always-on AI software team coordinated through GitHub and Temporal"
+description = "An always-on, autonomy-first AI software team coordinated through GitHub"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
@@ -14,7 +14,6 @@ dependencies = [
     "pyjwt[crypto]>=2.9",
     "pyyaml>=6.0",
     "slack-sdk>=3.33",
-    "temporalio>=1.35",
     "uvicorn[standard]>=0.30",
 ]
 

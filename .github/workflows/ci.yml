@@ -17,4 +17,7 @@ jobs:
       - run: uv sync --frozen
       - run: uv run ruff check . && uv run ruff format --check .
       - run: docker build -q -f sandbox-images/base/Dockerfile -t agent-company/sandbox-base:test .
+      - run: >-
+          docker build -q --build-arg BASE=agent-company/sandbox-base:test
+          -t agent-company/sandbox-rehearsal:test sandbox-images/rehearsal
       - run: uv run pytest -q

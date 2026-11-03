@@ -9,13 +9,15 @@ RUN apt-get update \
 # The Python Agent SDK bundles the Claude Code CLI, so no Node is needed for the agent itself.
 RUN pip install --no-cache-dir "claude-agent-sdk>=0.2.176" "httpx>=0.27" "pydantic-settings>=2.4" "pyyaml>=6.0"
 
-# Runtime, prompts, configs and hooks are root-owned and read-only to the agent:
-# agents cannot edit their own prompts, configs or guardrails.
-COPY core /opt/agent-company/core
+# Only the in-sandbox code: the runner, role prompts/configs/hooks, and the model interface.
+# Nothing here can talk to GitHub. Root-owned and read-only to the agent.
+COPY core/__init__.py core/model.py core/settings.py /opt/agent-company/core/
 COPY agents /opt/agent-company/agents
-RUN chmod -R a-w /opt/agent-company
+RUN find /opt/agent-company -name __pycache__ -prune -exec rm -rf {} + && chmod -R a-w /opt/agent-company
 
-RUN useradd --create-home --uid 10001 agent && mkdir /workspace && chown agent:agent /workspace
+# /task is filled by the worker before start (docker cp); /out is collected after the run.
+RUN useradd --create-home --uid 10001 agent \
+ && mkdir /workspace /out /task && chown agent:agent /workspace /out
 USER agent
 ENV PYTHONPATH=/opt/agent-company \
     PYTHONDONTWRITEBYTECODE=1 \

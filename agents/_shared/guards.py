@@ -1,10 +1,9 @@
-"""Pre-tool-use checks shared by all roles. Pure stdlib: this runs inside the sandbox.
+"""Pre-tool-use hints shared by all roles. Pure stdlib: this runs inside the sandbox.
 
-Hooks are the first line of defense. They are best effort against shell tricks, which is why the
-runner re-checks the final diff (`protected_paths_touched`) before pushing, and why branch
-protection, CODEOWNERS and App permissions sit behind both.
-
-Each check returns a reason string to deny, or None to allow.
+These are early feedback, not the security boundary. The sandbox holds no GitHub credentials, and
+the worker re-checks every result in its own clean repository (`core/gitops.py`) before pushing.
+So the hooks only stop actions that would certainly be rejected later, saving the agent a wasted
+run; they don't try to police a disposable container.
 """
 
 import re
@@ -14,40 +13,51 @@ from pathlib import PurePosixPath
 
 WORKSPACE = "/workspace"
 
-# Paths agents never modify. CI, infra and secrets are human-only (also enforced by CODEOWNERS).
+# Paths agents never change. CI, infra, secrets and everything that steers the agents themselves
+# (instructions, brain, policy) belong to a human. The worker refuses to push changes to them.
 PROTECTED_GLOBS = [
-    ".github/*",
     ".github/**",
-    "infra/*",
     "infra/**",
-    ".claude/*",
     ".claude/**",
-    "**/.env",
+    ".agent-company/**",
+    "docs/brain/**",
+    "CLAUDE.md",
+    "**/CLAUDE.md",
+    ".mcp.json",
     ".env",
-    "**/.env.*",
+    "**/.env",
     ".env.*",
-    "**/*.pem",
+    "**/.env.*",
     "*.pem",
-    "**/*.key",
+    "**/*.pem",
     "*.key",
-    "**/secrets/**",
+    "**/*.key",
     "secrets/**",
+    "**/secrets/**",
     ".sops.yaml",
     "CODEOWNERS",
     "**/CODEOWNERS",
 ]
 
 FILE_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+_PROTECTED_ROOTS = (".github/", "infra/", ".claude/", ".agent-company/", "docs/brain/", "CLAUDE.md", "CODEOWNERS")
 
-_SECRET_READS = re.compile(
-    r"(^|[\s;&|(])(env|printenv|set)(\s*$|\s*[;&|)])|/proc/[^\s]*/environ|\.git-credentials|"
-    r"credential\.helper|\$\{?(GH_TOKEN|GITHUB_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)\b"
-)
-_NETWORK_TOOLS = re.compile(r"(^|[\s;&|(])(curl|wget|nc|ncat|telnet|ssh|scp|rsync|ftp)\s")
+
+def path_matches(path: str, pattern: str) -> bool:
+    """fnmatch where a leading `**/` also matches at the top level."""
+    return fnmatch(path, pattern) or (pattern.startswith("**/") and fnmatch(path, pattern[3:]))
+
+
+def is_protected(rel_path: str) -> bool:
+    return any(path_matches(rel_path, g) for g in PROTECTED_GLOBS)
+
+
+def protected_paths_touched(changed_files: list[str]) -> list[str]:
+    return [f for f in changed_files if is_protected(f)]
 
 
 def relative_to_workspace(path: str, cwd: str = WORKSPACE) -> str | None:
-    """Normalize a path; None if it escapes the workspace."""
+    """Normalize a path; None if it is outside the workspace."""
     p = PurePosixPath(path if path.startswith("/") else f"{cwd}/{path}")
     parts: list[str] = []
     for part in p.parts[1:]:
@@ -65,27 +75,20 @@ def relative_to_workspace(path: str, cwd: str = WORKSPACE) -> str | None:
     return norm[len(WORKSPACE) + 1 :]
 
 
-def is_protected(rel_path: str) -> bool:
-    return any(fnmatch(rel_path, g) for g in PROTECTED_GLOBS)
-
-
-def protected_paths_touched(changed_files: list[str]) -> list[str]:
-    return [f for f in changed_files if is_protected(f)]
-
-
 def check_file_write(tool: str, tool_input: dict) -> str | None:
     if tool not in FILE_WRITE_TOOLS:
         return None
     path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
     rel = relative_to_workspace(path)
-    if rel is None:
-        return f"writes outside {WORKSPACE} are not allowed ({path})"
-    if is_protected(rel):
-        return f"{rel} is a protected path (CI, infra, secrets or agent settings); ask a human instead"
+    if rel is not None and is_protected(rel):
+        return (
+            f"{rel} is a protected path (CI, infra, secrets, or agent instructions). Changes there "
+            "are never pushed; finish without it and list what is needed in open_questions."
+        )
     return None
 
 
-def _segments(command: str) -> list[list[str]]:
+def segments(command: str) -> list[list[str]]:
     """Split a shell command on ; && || | and newlines into token lists (best effort)."""
     out: list[list[str]] = []
     for chunk in re.split(r"&&|\|\||[;|\n]", command):
@@ -93,51 +96,11 @@ def _segments(command: str) -> list[list[str]]:
             tokens = shlex.split(chunk)
         except ValueError:
             tokens = chunk.split()
+        while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
+            tokens = tokens[1:]  # leading VAR=value assignments
         if tokens:
             out.append(tokens)
     return out
-
-
-def check_bash_common(command: str) -> str | None:
-    if _SECRET_READS.search(command):
-        return "reading credentials or the environment is not allowed"
-    if _NETWORK_TOOLS.search(command):
-        return "direct network tools are not allowed; package managers go through the egress proxy"
-    for tokens in _segments(command):
-        # Skip leading env assignments and sudo-like wrappers.
-        while tokens and ("=" in tokens[0] and not tokens[0].startswith("-")):
-            tokens = tokens[1:]
-        if not tokens:
-            continue
-        prog = PurePosixPath(tokens[0]).name
-        if prog in ("sudo", "su", "doas"):
-            return "privilege escalation is not allowed"
-        if prog == "git":
-            reason = _check_git(tokens[1:])
-            if reason:
-                return reason
-        if prog in ("rm", "rmdir", "shred", "unlink", "mv", "chmod", "chown", "truncate", "dd"):
-            for target in tokens[1:]:
-                if target.startswith("-"):
-                    continue
-                if prog == "dd":
-                    if not target.startswith("of="):
-                        continue
-                    target = target.removeprefix("of=")
-                if target.startswith("~"):
-                    return f"{prog} outside {WORKSPACE} is not allowed ({target})"
-                rel = relative_to_workspace(target)
-                if rel is None:
-                    return f"{prog} outside {WORKSPACE} is not allowed ({target})"
-                if rel == "" or rel == ".git" or rel.startswith(".git/"):
-                    return f"{prog} on the workspace root or .git is not allowed"
-                if is_protected(rel):
-                    return f"{rel} is a protected path"
-    # Shell writes into protected paths (redirects, sed -i, tee, cp, ...).
-    for glob_root in (".github/", "infra/", ".claude/", ".env", "secrets/", "CODEOWNERS", ".sops.yaml"):
-        if glob_root in command and re.search(r"(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\binstall\b|\bln\b)", command):
-            return f"modifying {glob_root} from the shell is not allowed"
-    return None
 
 
 # Global git options that consume the next argument (`git -c k=v push`, `git -C dir push`).
@@ -158,18 +121,69 @@ def git_subcommand(args: list[str]) -> str:
     return ""
 
 
-def _check_git(args: list[str]) -> str | None:
+def check_git(args: list[str]) -> str | None:
     sub = git_subcommand(args)
     if sub == "push":
-        return "the runner pushes your branch when you finish; do not push yourself"
-    if sub in ("remote", "config") and any(a in args for a in ("set-url", "add", "--add", "url", "credential.helper")):
-        return "changing remotes or git credentials is not allowed"
-    if sub == "reset" and "--hard" in args and any("origin" in a or "@{u}" in a for a in args):
-        return "resetting to a remote ref is not allowed; make a new commit instead"
-    if sub in ("filter-branch", "filter-repo", "update-ref", "replace", "gc", "prune", "reflog"):
-        return f"git {sub} is not allowed"
-    if sub == "branch" and any(a in ("-D", "-d", "--delete", "-M", "-m") for a in args):
-        return "deleting or renaming branches is not allowed"
-    if sub == "checkout" and any(a in ("--orphan",) for a in args):
-        return "orphan branches are not allowed"
+        return "there is no remote to push to; commit your work and the platform hands it off when you finish"
+    if sub in ("rebase", "filter-branch", "filter-repo", "replace"):
+        return f"git {sub} rewrites history, and rewritten history is rejected; add new commits instead"
+    if sub == "reset" and "--hard" in args and any("origin" in a or "@{u}" in a or "~" in a for a in args):
+        return "resetting away existing commits is rejected; add a new commit that undoes the change instead"
+    if sub == "checkout" and "--orphan" in args:
+        return "orphan branches are rejected"
+    return None
+
+
+def check_engineer_bash(command: str) -> str | None:
+    for tokens in segments(command):
+        if PurePosixPath(tokens[0]).name == "git":
+            reason = check_git(tokens[1:])
+            if reason:
+                return reason
+    if any(root in command for root in _PROTECTED_ROOTS) and re.search(
+        r"(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\brm\b|\binstall\b|\bln\b)", command
+    ):
+        return "that command modifies a protected path; such changes are never pushed"
+    return None
+
+
+READ_ONLY_PROGRAMS = {
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "grep",
+    "rg",
+    "find",
+    "tree",
+    "file",
+    "stat",
+    "diff",
+    "sort",
+    "uniq",
+}
+READ_ONLY_GIT = {"diff", "log", "show", "status", "blame", "ls-files", "rev-parse", "grep", "shortlog", "merge-base"}
+
+
+def check_read_only(tool: str, tool_input: dict) -> str | None:
+    """For roles that only inspect the code (reviewer, tech lead)."""
+    if tool in FILE_WRITE_TOOLS:
+        return "this role is read-only; put what should change in your output"
+    if tool != "Bash":
+        return None
+    command = tool_input.get("command", "")
+    if any(op in command for op in (">", "$(", "`")):
+        return "redirects and command substitution are not available to this role"
+    for tokens in segments(command):
+        prog = PurePosixPath(tokens[0]).name
+        if prog == "git":
+            sub = git_subcommand(tokens[1:])
+            if sub not in READ_ONLY_GIT:
+                return f"git {sub} is not a read-only command"
+        elif prog == "find":
+            if any(t in ("-exec", "-execdir", "-delete", "-ok", "-fprint") for t in tokens):
+                return "find may only list files"
+        elif prog not in READ_ONLY_PROGRAMS:
+            return f"{prog} is not on the read-only allowlist"
     return None
