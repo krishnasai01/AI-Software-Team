@@ -1,6 +1,10 @@
 # Setup runbook (Phase 0 → rehearsal → pilot)
 
-These steps need your accounts, so they can't be automated from this repo. `docs/design-v2.md`
+**Prefer the assistant:** `uv run python -m onboarding software-team` detects what is already done,
+asks for what is missing, and does most of the steps below for you after your yes (see
+`docs/onboarding.md`). This runbook stays as the manual reference.
+
+These steps need your accounts, so some can't be automated from this repo. `docs/design-v2.md`
 explains what each piece is for.
 
 ## 1. Servers

@@ -7,7 +7,7 @@ GitHub enforces the roster, not this module. Tokens never enter a sandbox.
 import base64
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 import jwt
@@ -49,6 +49,30 @@ class CIState:
     failed_run_ids: tuple[int, ...] = ()  # GitHub Actions runs that can be re-run
 
 
+def app_jwt(app_id: int, private_key: str) -> str:
+    now = int(time.time())
+    return jwt.encode({"iat": now - 60, "exp": now + 540, "iss": str(app_id)}, private_key, "RS256")
+
+
+class TokenSource(Protocol):
+    """What `GitHub` needs to authenticate: an App's installation tokens, or a person's own token."""
+
+    api: str
+
+    async def token(self, repo: str, permissions: dict[str, str] | None = None) -> str: ...
+
+
+class UserToken:
+    """A person's own token. Onboarding uses it to set up repos before the Apps are installed."""
+
+    def __init__(self, token: str, api: str | None = None):
+        self._token = token
+        self.api = api or get_settings().github_api_url
+
+    async def token(self, repo: str, permissions: dict[str, str] | None = None) -> str:
+        return self._token
+
+
 class GitHubApp:
     """Mints short-lived (1 hour) installation tokens, optionally scoped to one repo."""
 
@@ -63,8 +87,7 @@ class GitHubApp:
         self._cache: dict[tuple[str, frozenset], tuple[str, float]] = {}
 
     def _jwt(self) -> str:
-        now = int(time.time())
-        return jwt.encode({"iat": now - 60, "exp": now + 540, "iss": str(self.app_id)}, self.private_key, "RS256")
+        return app_jwt(self.app_id, self.private_key)
 
     async def token(self, repo: str, permissions: dict[str, str] | None = None) -> str:
         key = (repo, frozenset((permissions or {}).items()))
@@ -85,6 +108,49 @@ class GitHubApp:
         return token
 
 
+class AppAdmin:
+    """An App as itself (JWT): what it may do, where it delivers webhooks, where it is installed."""
+
+    def __init__(self, app_id: int, private_key: str, api: str | None = None):
+        self.app_id = app_id
+        self.private_key = private_key
+        self.api = api or get_settings().github_api_url
+
+    async def _request(self, method: str, path: str, **kw: Any) -> httpx.Response:
+        headers = {
+            "Authorization": f"Bearer {app_jwt(self.app_id, self.private_key)}",
+            "Accept": "application/vnd.github+json",
+        }
+        async with httpx.AsyncClient(base_url=self.api, headers=headers, timeout=30) as c:
+            return await c.request(method, path, **kw)
+
+    async def info(self) -> dict:
+        """slug, name, permissions, events."""
+        r = await self._request("GET", "/app")
+        r.raise_for_status()
+        return r.json()
+
+    async def hook_config(self) -> dict:
+        r = await self._request("GET", "/app/hook/config")
+        r.raise_for_status()
+        return r.json()
+
+    async def set_hook_config(self, url: str, secret: str) -> None:
+        r = await self._request(
+            "PATCH",
+            "/app/hook/config",
+            json={"url": url, "content_type": "json", "secret": secret, "insecure_ssl": "0"},
+        )
+        _raise_for_status(r)
+
+    async def installed_on(self, repo: str) -> bool:
+        r = await self._request("GET", f"/repos/{repo}/installation")
+        if r.status_code == 404:
+            return False
+        r.raise_for_status()
+        return True
+
+
 _apps: dict[str, GitHubApp] = {}
 
 
@@ -101,7 +167,7 @@ def _raise_for_status(r: httpx.Response) -> None:
 
 
 class GitHub:
-    def __init__(self, role: str, app: GitHubApp | None = None):
+    def __init__(self, role: str, app: TokenSource | None = None):
         self.app = app or app_for(role)
 
     async def _client(self, repo: str) -> httpx.AsyncClient:
@@ -140,7 +206,11 @@ class GitHub:
         return await self._request(repo, "GET", f"/repos/{repo}/issues/{number}")
 
     async def list_open_issues(self, repo: str, label: str) -> list[dict]:
-        issues = await self._paged(repo, f"/repos/{repo}/issues", {"labels": label, "state": "open"})
+        return await self.list_issues(repo, label, "open")
+
+    async def list_issues(self, repo: str, label: str | None = None, state: str = "all") -> list[dict]:
+        params = {"state": state, **({"labels": label} if label else {})}
+        issues = await self._paged(repo, f"/repos/{repo}/issues", params)
         return [i for i in issues if "pull_request" not in i]
 
     async def label_actor(self, repo: str, number: int, label: str) -> str | None:
@@ -283,6 +353,12 @@ class GitHub:
     async def rerun_failed_jobs(self, repo: str, run_id: int) -> None:
         await self._request(repo, "POST", f"/repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs")
 
+    async def check_run(self, repo: str, sha: str, name: str) -> dict | None:
+        runs = await self._paged(
+            repo, f"/repos/{repo}/commits/{sha}/check-runs", {"check_name": name}, key="check_runs"
+        )
+        return runs[0] if runs else None
+
     async def post_check(
         self, repo: str, sha: str, name: str, conclusion: str | None, title: str, summary: str
     ) -> None:
@@ -298,6 +374,45 @@ class GitHub:
 
     async def branch_rules(self, repo: str, branch: str) -> list[dict]:
         return await self._paged(repo, f"/repos/{repo}/rules/branches/{branch}")
+
+    async def get_repo(self, repo: str) -> dict:
+        return await self._request(repo, "GET", f"/repos/{repo}")
+
+    async def update_repo(self, repo: str, **fields: Any) -> None:
+        await self._request(repo, "PATCH", f"/repos/{repo}", json=fields)
+
+    async def list_rulesets(self, repo: str) -> list[dict]:
+        return await self._paged(repo, f"/repos/{repo}/rulesets")
+
+    async def create_ruleset(self, repo: str, payload: dict) -> int:
+        return (await self._request(repo, "POST", f"/repos/{repo}/rulesets", json=payload))["id"]
+
+    async def update_ruleset(self, repo: str, ruleset_id: int, payload: dict) -> None:
+        await self._request(repo, "PUT", f"/repos/{repo}/rulesets/{ruleset_id}", json=payload)
+
+    async def put_files(self, repo: str, base: str, branch: str, files: dict[str, str], message: str) -> str:
+        """Commit text files (path -> content) on a new `branch` cut from `base`. Returns the commit sha."""
+        base_sha = (await self._request(repo, "GET", f"/repos/{repo}/git/ref/heads/{base}"))["object"]["sha"]
+        base_commit = await self._request(repo, "GET", f"/repos/{repo}/git/commits/{base_sha}")
+        entries = []
+        for path, text in files.items():
+            blob = await self._request(
+                repo, "POST", f"/repos/{repo}/git/blobs", json={"content": text, "encoding": "utf-8"}
+            )
+            entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+        tree = await self._request(
+            repo, "POST", f"/repos/{repo}/git/trees", json={"base_tree": base_commit["tree"]["sha"], "tree": entries}
+        )
+        commit = await self._request(
+            repo,
+            "POST",
+            f"/repos/{repo}/git/commits",
+            json={"message": message, "tree": tree["sha"], "parents": [base_sha]},
+        )
+        await self._request(
+            repo, "POST", f"/repos/{repo}/git/refs", json={"ref": f"refs/heads/{branch}", "sha": commit["sha"]}
+        )
+        return commit["sha"]
 
     async def file_at(self, repo: str, path: str, ref: str) -> str | None:
         async with await self._client(repo) as c:

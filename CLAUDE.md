@@ -27,6 +27,8 @@ Full suite (what CI runs):
 Processes: `python -m db.migrate`, `python -m orchestrator.reconciler` (control server),
 `python -m orchestrator.worker` (worker server), `uvicorn orchestrator.webhooks.app:app`.
 Operator commands (kill switch, approvals, answers, levels): `python -m orchestrator.admin --help`.
+Onboarding assistant (a generic engine plus per-team playbooks; see `docs/onboarding.md`):
+`python -m onboarding software-team [--no-model | --status]`.
 
 ## Architecture
 
@@ -71,6 +73,18 @@ Operator commands (kill switch, approvals, answers, levels): `python -m orchestr
 **Identities.** `ctx.gh` is the orchestrator App (labels, issues, checks, auto-merge, reverts).
 `ctx.as_role("engineer")` opens PRs, and `ctx.as_role("reviewer")` posts reviews. Tests inject
 `tests/fakes.py`'s `FakeGitHub` for all of them.
+
+**Onboarding** (`onboarding/`, `docs/onboarding.md`). It runs on the operator's machine, with the operator's powers.
+- The engine (`engine.py`, `playbook.py`, `registry.py`) knows nothing about any team. A playbook
+  (`onboarding/playbooks/<name>/playbook.yaml`, plus `pack.py` for its probes and actions) describes one.
+  `software-team` is the one for this platform.
+- A step is done only when its probes say so. An action runs only after the operator's own yes at the
+  terminal, asked by the engine. The model (`chat.py`, through `core.model.ChatSession`) only steers,
+  with nine tools, no shell and no files.
+- Secrets are typed at hidden prompts or generated, passed to `sops` and servers on stdin, and scrubbed
+  (`SecretStore.redact`) from everything the model, the log or the terminal sees. Never put one in argv.
+- `pack.py` must stay in step with `infra/*/docker-compose.yml` (`ENV_KEYS`) and `docs/setup.md`;
+  `tests/test_onboarding_pack.py` fails when the compose files need a variable onboarding does not write.
 
 ## Rules that shape all code
 

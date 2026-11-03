@@ -2,11 +2,12 @@
 
 - `ask_model()`: a single completion (control side), through the proxy.
 - `run_agent()`: one Claude Agent SDK session. It runs *inside* a sandbox, called by the runner.
+- `ChatSession`: a multi-turn chat with in-process tools, for the operator's onboarding assistant.
 - `LiteLLM`: per-role teams with daily budgets and per-run keys inside them. The proxy sees every
   request, so it is the hard spending limit; concurrent runs cannot overshoot it.
 """
 
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -122,6 +123,87 @@ async def run_agent(session: AgentSession) -> AgentOutcome:
         errors=list(result.errors or []),
         denials=denials,
     )
+
+
+@dataclass
+class ChatTool:
+    """One tool of a chat. `schema` is a JSON schema; `handler` returns the text the model sees."""
+
+    name: str
+    description: str
+    schema: dict[str, Any]
+    handler: Callable[[dict], Awaitable[str]]
+
+
+class ChatError(Exception):
+    pass
+
+
+class ChatSession:
+    """A multi-turn conversation whose only tools are the ones given: no files, no shell.
+
+    It runs on an operator's machine (the onboarding chat), so it uses their own credentials,
+    ANTHROPIC_API_KEY or a Claude login, not the model proxy.
+    """
+
+    SERVER = "chat"
+
+    def __init__(self, instructions: str, tools: list[ChatTool], model: str, max_budget_usd: float = 2.0):
+        self.instructions = instructions
+        self.tools = tools
+        self.model = model
+        self.max_budget_usd = max_budget_usd
+        self.cost_usd = 0.0
+        self._client: Any = None
+
+    async def __aenter__(self) -> "ChatSession":
+        from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, create_sdk_mcp_server, tool
+
+        def wrap(handler: Callable[[dict], Awaitable[str]]):
+            async def call(args: dict) -> dict:
+                try:
+                    return {"content": [{"type": "text", "text": await handler(args or {})}]}
+                except Exception as e:  # noqa: BLE001  the model gets the error and can react
+                    return {"content": [{"type": "text", "text": f"error: {e}"}], "is_error": True}
+
+            return call
+
+        server = create_sdk_mcp_server(
+            self.SERVER, tools=[tool(t.name, t.description, t.schema)(wrap(t.handler)) for t in self.tools]
+        )
+        options = ClaudeAgentOptions(
+            system_prompt=self.instructions,
+            model=self.model,
+            tools=[],  # none of Claude Code's own tools
+            allowed_tools=[f"mcp__{self.SERVER}__{t.name}" for t in self.tools],
+            mcp_servers={self.SERVER: server},
+            permission_mode="dontAsk",
+            max_budget_usd=self.max_budget_usd,
+            setting_sources=[],
+            strict_mcp_config=True,
+        )
+        self._client = ClaudeSDKClient(options)
+        await self._client.connect()
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        if self._client is not None:
+            await self._client.disconnect()
+
+    async def turn(self, text: str) -> AsyncIterator[str]:
+        """Send one user message; yield the assistant's text as it arrives."""
+        from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+        await self._client.query(text)
+        async for message in self._client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock) and block.text.strip():
+                        yield block.text
+            elif isinstance(message, ResultMessage):
+                self.cost_usd = message.total_cost_usd or self.cost_usd
+                if message.is_error:
+                    raise ChatError(f"{message.subtype}: {'; '.join(message.errors or []) or message.result or ''}")
 
 
 class LiteLLM:
