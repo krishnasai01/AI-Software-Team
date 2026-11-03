@@ -1,0 +1,22 @@
+role: engineer
+model: claude-opus-5-5
+tools: [Read, Write, Edit, MultiEdit, Glob, Grep, Bash, TodoWrite]
+mcp_servers: {}
+max_turns: 150
+max_budget_usd_per_run: 15     # also enforced by the proxy key minted for the run
+run_timeout_minutes: 90
+output_schema:
+  type: object
+  required: [status, summary, pr_title, pr_body, tests_run, open_questions]
+  properties:
+    status: {type: string, enum: [completed, blocked]}
+    summary: {type: string, description: "What changed and why, 2-5 sentences"}
+    pr_title: {type: string}
+    pr_body: {type: string, description: "Markdown PR description; must include 'Closes #<issue>'"}
+    tests_run:
+      type: array
+      items:
+        type: object
+        required: [command, passed]
+        properties: {command: {type: string}, passed: {type: boolean}}
+    open_questions: {type: array, items: {type: string}}

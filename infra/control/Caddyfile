@@ -1,0 +1,10 @@
+# Public surface: only GitHub webhook delivery. Temporal UI, Grafana and Langfuse stay on the
+# private network (Tailscale / WireGuard).
+{$PUBLIC_HOSTNAME} {
+	handle /webhooks/github {
+		reverse_proxy webhook:8000
+	}
+	handle {
+		respond 404
+	}
+}

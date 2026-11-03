@@ -1,0 +1,6 @@
+# Human-only paths: CI, infra, secrets config, and the agents' own prompts, configs and guardrails.
+* @REPLACE_WITH_YOUR_LOGIN
+/.github/ @REPLACE_WITH_YOUR_LOGIN
+/infra/ @REPLACE_WITH_YOUR_LOGIN
+/agents/ @REPLACE_WITH_YOUR_LOGIN
+/.sops.yaml @REPLACE_WITH_YOUR_LOGIN

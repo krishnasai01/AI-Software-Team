@@ -1,0 +1,51 @@
+[project]
+name = "agent-company"
+version = "0.1.0"
+description = "An always-on AI software team coordinated through GitHub and Temporal"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "anthropic>=0.40",
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "psycopg[binary,pool]>=3.2",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.4",
+    "pyjwt[crypto]>=2.9",
+    "pyyaml>=6.0",
+    "slack-sdk>=3.33",
+    "temporalio>=1.35",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+# Only needed inside sandbox images, where the agent actually runs.
+sandbox = ["claude-agent-sdk>=0.2.176"]
+
+[dependency-groups]
+dev = [
+    "claude-agent-sdk>=0.2.176",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["core", "orchestrator", "agents", "db"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["db: needs a Postgres reachable at TEST_DATABASE_URL"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

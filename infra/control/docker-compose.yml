@@ -1,0 +1,101 @@
+# Control server: shared state and workflows. Admin ports bind to the private network only.
+#   sops exec-env ../secrets/control.enc.env 'docker compose up -d'
+name: agent-company-control
+
+x-platform: &platform
+  image: agent-company/platform:latest
+  build: {context: ../.., dockerfile: infra/platform.Dockerfile}
+  restart: unless-stopped
+  environment: &platform-env
+    DATABASE_URL: postgresql://agent:${POSTGRES_PASSWORD}@postgres:5432/agent_company
+    TEMPORAL_ADDRESS: temporal:7233
+    GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
+    GITHUB_APP_IDS: ${GITHUB_APP_IDS}
+    TRUSTED_LABELERS: ${TRUSTED_LABELERS}
+    SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
+    SLACK_CHANNEL: ${SLACK_CHANNEL}
+    LITELLM_URL: http://${WORKER_PRIVATE_IP}:4000
+    LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+    LANGFUSE_URL: ${LANGFUSE_URL:-}
+  volumes:
+    - ${GITHUB_APP_KEY_DIR:-/etc/agent-company/github-apps}:/run/secrets/github-apps:ro
+  depends_on:
+    migrate: {condition: service_completed_successfully}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: agent_company
+    volumes:
+      - postgres:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    ports: ["${PRIVATE_IP}:5432:5432"]   # worker server (LiteLLM keys) and backups
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "agent", "-d", "agent_company"]
+      interval: 5s
+      retries: 20
+
+  valkey:
+    image: valkey/valkey:8
+    restart: unless-stopped
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes: [valkey:/data]
+
+  temporal:
+    image: temporalio/auto-setup:${TEMPORAL_VERSION:-1.28}
+    restart: unless-stopped
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: agent
+      POSTGRES_PWD: ${POSTGRES_PASSWORD}
+      POSTGRES_SEEDS: postgres
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["${PRIVATE_IP}:7233:7233"]   # agent workers on the worker server
+
+  temporal-ui:
+    image: temporalio/ui:${TEMPORAL_UI_VERSION:-2.38.0}
+    restart: unless-stopped
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports: ["${PRIVATE_IP}:8080:8080"]
+
+  migrate:
+    image: agent-company/platform:latest
+    build: {context: ../.., dockerfile: infra/platform.Dockerfile}
+    command: ["python", "-m", "db.migrate"]
+    environment:
+      DATABASE_URL: postgresql://agent:${POSTGRES_PASSWORD}@postgres:5432/agent_company
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  webhook:
+    <<: *platform
+    command: ["uvicorn", "orchestrator.webhooks.app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  orchestration-worker:
+    <<: *platform
+    command: ["python", "-m", "orchestrator.worker", "orchestration"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      temporal: {condition: service_started}
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]   # the only public ports: webhook delivery
+    environment:
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy:/data
+
+volumes:
+  postgres:
+  valkey:
+  caddy:
