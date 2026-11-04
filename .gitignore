@@ -1,0 +1,8 @@
+# /devteam run state, update backups and logs (per machine)
+.devteam/
+# Superpowers worktrees for critical features
+.worktrees/
+# OMC runtime state (OMC's setup also lists this in .git/info/exclude; .omc/skills/ stays committable)
+.omc/*
+!.omc/skills/
+.venv/

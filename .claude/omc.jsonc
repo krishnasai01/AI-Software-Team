@@ -1,0 +1,16 @@
+// Project OMC config. See CLAUDE.md "Tool ownership".
+{
+  "keywordDetector": {
+    // Natural-language triggers that would let OMC seize work another tool
+    // owns: "tdd"/"test first" (Superpowers), "code review"/"security review"
+    // (gstack), and "build me an app"/"I want a ..."/"ralph"/"ultragoal",
+    // which would start autonomous execution outside the /devteam phases.
+    // Explicit /oh-my-claudecode:* invocations still work.
+    "disabled": ["tdd", "code-review", "security-review", "autopilot", "ralph", "ultragoal"]
+  },
+  "autopilot": {
+    // Code review and the security pass belong to gstack (/review, /cso).
+    // Autopilot's own build/lint/test loop (its "QA" phase) stays on.
+    "skipValidation": true
+  }
+}
