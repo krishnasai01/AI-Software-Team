@@ -11,6 +11,10 @@
 #   --new       archive the current run (.devteam/archive/) and start over
 #   --prepare   intake only, no launch (what /devteam itself calls)
 #   -- ...      extra arguments for claude, e.g. -- --model sonnet
+#
+# Planning stops for your answers and approval; after the plan is approved the
+# run is unattended through /ship. Claude starts in the "auto" permission mode
+# so tool prompts don't stop it; pass -- --permission-mode <mode> to override.
 set -euo pipefail
 . "$(dirname "$0")/lib/common.sh"
 add_user_tool_paths
@@ -40,6 +44,24 @@ done
 
 have node || die "Node.js is required (run scripts/setup-prereqs.sh)"
 [ $show_status = 1 ] && exec node "$DT_JS" status
+
+# Permission prompts would stall the unattended part, so default to "auto"
+# (routine actions run, risky ones are refused instead of asked).
+case " ${claude_args[*]} " in
+  *" --permission-mode"*|*" --dangerously-skip-permissions "*) ;;
+  *) claude_args=(--permission-mode auto "${claude_args[@]}") ;;
+esac
+
+# /ship opens the PR with the GitHub CLI; without it the unattended run blocks
+# at the last phase, so say so while someone is still watching.
+check_ship_tools() {
+  git -C "$REPO_ROOT" remote get-url origin 2>/dev/null | grep -q github.com || return 0
+  if ! have gh; then
+    warn "/ship opens the PR with the GitHub CLI (gh), which is not installed; the run will block at ship (install: https://cli.github.com)"
+  elif ! gh auth status >/dev/null 2>&1; then
+    warn "gh is not logged in, so the run will block at ship; run: gh auth login"
+  fi
+}
 
 # Relative goal files resolve against the caller's directory, then the repo.
 goal_file=""
@@ -75,8 +97,10 @@ if [ $dry_run = 1 ]; then
   if [ -f "$DT_DIR/state.json" ] && [ $have_goal = 1 ] && [ $new = 0 ]; then
     printf 'State     a run already exists; it resumes if this is the same goal, otherwise pass --new\n'
   fi
-  launch="claude \"/devteam${goal_arg:+ $goal_arg}\"${claude_args[*]:+ ${claude_args[*]}}"
+  launch="claude ${claude_args[*]} \"/devteam${goal_arg:+ $goal_arg}\""
   printf 'Launch    %s\n\n' "$launch"
+  phases="$(node "$DT_JS" phases)"
+  last_gate="$(printf '%s\n' "$phases" | awk -F'\t' '$4 == "gate" { g = $1 } END { print g }')"
   printf '%s %-3s %-16s %-12s %s%s\n' "$C_BOLD" "#" "Phase" "Owner" "What happens" "$C_OFF"
   n=0
   while IFS=$'\t' read -r id owner cmds kind summary; do
@@ -87,8 +111,10 @@ if [ $dry_run = 1 ]; then
       printf '  %-3s %-16s %-12s %s\n' "$n" "$id" "$owner" "$summary"
       [ "$cmds" = - ] || printf '  %-3s %-16s %-12s %s\n' "" "" "" "  via ${cmds// /, }"
     fi
-  done < <(node "$DT_JS" phases)
+    [ "$id" = "$last_gate" ] && printf '  %s--- unattended from here: no questions or approval stops until /ship opens the PR ---%s\n' "$C_BOLD" "$C_OFF"
+  done <<< "$phases"
   have claude || warn "claude is not on PATH; install Claude Code before a real run"
+  check_ship_tools
   exit 0
 fi
 
@@ -123,6 +149,7 @@ case "$result" in
 esac
 node "$DT_JS" status
 
+check_ship_tools
 [ $prepare = 1 ] && exit 0
 have claude || die "claude is not on PATH (https://claude.com/claude-code)"
 cd "$REPO_ROOT"

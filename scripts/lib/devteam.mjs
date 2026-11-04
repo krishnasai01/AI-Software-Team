@@ -6,9 +6,10 @@
 //   devteam.mjs phases [--json]
 //   devteam.mjs critical <goal.md>               list the goal's "Critical features"
 //   devteam.mjs init <goal.md> <source>          create state, or resume the same goal
-//   devteam.mjs status | next
+//   devteam.mjs status | next | mode
 //   devteam.mjs start|done <phase> [note]
 //   devteam.mjs skip <phase> <reason>
+//   devteam.mjs block <phase> <reason>           stop an unattended run that needs a human
 //   devteam.mjs note <phase> <text>
 //   devteam.mjs artifact <phase> <path>
 //   devteam.mjs gate <phase>                     mark an approval gate as waiting
@@ -67,11 +68,26 @@ function readState() {
   return JSON.parse(fs.readFileSync(statePath, 'utf8'));
 }
 
+// The run as the hooks see it: null when there is no readable run.
+export function loadState() {
+  try { return JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch { return null; }
+}
+
+// planning: a human answers questions and approves the plan.
+// unattended: every gate is approved; nothing may wait on a human until the run
+// is complete or blocked.
+export function runMode(state) {
+  if (!state) return 'none';
+  if (state.status === 'complete' || state.status === 'blocked') return state.status;
+  const gates = state.phases.filter((p) => p.kind === 'gate');
+  return gates.every((p) => p.status === 'approved') ? 'unattended' : 'planning';
+}
+
 function writeState(state) {
   state.updated_at = now();
   const next = state.phases.find((p) => !FINISHED.has(p.status));
   state.current_phase = next ? next.id : null;
-  state.status = !next ? 'complete' : next.status === 'awaiting_approval' ? 'awaiting_approval' : 'running';
+  state.status = !next ? 'complete' : ['awaiting_approval', 'blocked'].includes(next.status) ? next.status : 'running';
   fs.mkdirSync(stateDir, { recursive: true });
   const tmp = `${statePath}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
@@ -125,8 +141,8 @@ function init(goalFile, source) {
 
 function status() {
   const s = readState();
-  const mark = { done: 'x', skipped: '-', approved: 'x', in_progress: '>', awaiting_approval: '?', pending: ' ' };
-  console.log(`run ${s.run_id}  branch ${s.branch}  status ${s.status}`);
+  const mark = { done: 'x', skipped: '-', approved: 'x', in_progress: '>', awaiting_approval: '?', blocked: '!', pending: ' ' };
+  console.log(`run ${s.run_id}  branch ${s.branch}  status ${s.status}  mode ${runMode(s)}`);
   console.log(`goal ${s.goal.path} (${s.goal.source}); critical features ${s.critical_source === 'goal' ? 'from the goal' : 'inferred'}`);
   for (const p of s.phases) {
     const extra = p.notes.length ? `  — ${p.notes[p.notes.length - 1]}` : '';
@@ -160,6 +176,13 @@ function setPhase(cmd, id, text) {
       if (!text) fail('skip needs a reason');
       requireOrder(s, i);
       Object.assign(p, { status: 'skipped', finished_at: now() });
+      break;
+    case 'block':
+      if (p.kind === 'gate') fail(`"${id}" is an approval gate; it already waits for the user`);
+      if (!text) fail('block needs a reason');
+      requireOrder(s, i);
+      Object.assign(p, { status: 'blocked', blocked_at: now() });
+      text = `BLOCKED: ${text}`;
       break;
     case 'gate':
       if (p.kind !== 'gate') fail(`"${id}" is not an approval gate`);
@@ -233,13 +256,14 @@ if (isMain()) {
     case 'init': init(args[0], args[1]); break;
     case 'status': status(); break;
     case 'next': console.log(readState().current_phase ?? 'complete'); break;
-    case 'start': case 'done': case 'skip': case 'note': case 'artifact': case 'gate': case 'approve':
+    case 'mode': console.log(runMode(loadState())); break;
+    case 'start': case 'done': case 'skip': case 'block': case 'note': case 'artifact': case 'gate': case 'approve':
       if (!args[0]) fail(`usage: ${cmd} <phase>`);
       setPhase(cmd, args[0], args.slice(1).join(' ') || undefined);
       break;
     case 'feature': feature(args); break;
     case 'archive': archive(); break;
     default:
-      fail('usage: devteam.mjs phases|critical|init|status|next|start|done|skip|note|artifact|gate|approve|feature|archive');
+      fail('usage: devteam.mjs phases|critical|init|status|next|mode|start|done|skip|block|note|artifact|gate|approve|feature|archive');
   }
 }

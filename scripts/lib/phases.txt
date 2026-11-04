@@ -1,6 +1,8 @@
 # The /devteam pipeline, in order. Single source of truth for scripts/devteam.sh
 # (--dry-run, state), .claude/commands/devteam.md and scripts/smoke-test.sh.
 #
+# Everything after the last gate runs unattended (see runMode in devteam.mjs).
+#
 # id | owner | commands (space-separated; "-" = none) | kind (phase|gate) | summary
 intake          | devteam     | -                                                                    | phase | Save the goal to .devteam/goal.md and start .devteam/state.json
 office-hours    | gstack      | /office-hours                                                        | phase | Pressure-test the product idea: demand, users, wedge, scope
@@ -16,5 +18,4 @@ merge           | devteam     | -                                               
 review          | gstack      | /review                                                              | phase | Pre-landing code review of the whole diff
 qa              | gstack      | /qa                                                                  | phase | Exercise the product end to end and fix what breaks
 cso             | gstack      | /cso                                                                 | phase | Security audit
-approve-ship    | you         | -                                                                    | gate  | shipping (after review, QA and the security audit)
 ship            | gstack      | /ship                                                                | phase | Merge base, test, bump version and changelog, push, open the PR

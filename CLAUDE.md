@@ -41,9 +41,12 @@ Rules:
    feature, at any stage, is also made test-first.
 4. **Full pipeline = `/devteam`.** For a new product or a multi-feature goal, use
    `/devteam <goal-file | goal text>` (or `scripts/devteam.sh`). It runs the phases in
-   order, records progress in `.devteam/state.json` and stops for approval after
-   planning and before `/ship`. Don't skip an approval gate or mark one approved
-   without the user's explicit yes.
+   order and records progress in `.devteam/state.json`. Planning is interactive and
+   ends at one approval gate; don't skip it or mark it approved without the user's
+   explicit yes. After that approval the run is unattended through `/ship`: don't
+   ask the user anything, take the recommended option and log it in
+   `.devteam/artifacts/decisions.md`, and stop only to block on something a person
+   must provide (`.claude/commands/devteam.md` section 5).
 5. **Small one-off tasks** (a bug fix, a question) don't need the pipeline. Pick the
    owner by the table: fixes in critical code go through Superpowers TDD, other fixes
    are made directly, then gstack `/review`.

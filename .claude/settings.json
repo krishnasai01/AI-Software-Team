@@ -13,6 +13,34 @@
             "onFailure": "block"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/devteam-autonomy.mjs\" bash"
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion|mcp__.*AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/devteam-autonomy.mjs\" ask"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/devteam-autonomy.mjs\" stop"
+          }
+        ]
       }
     ]
   },

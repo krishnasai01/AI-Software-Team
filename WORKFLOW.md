@@ -99,18 +99,49 @@ users, features, critical features, tech stack, acceptance criteria.
 | 5 | ralplan | OMC | `/oh-my-claudecode:ralplan`: planner/architect/critic consensus plan |
 | 6 | plan-eng-review | gstack | `/plan-eng-review`: architecture, data flow, edge cases, test plan |
 | 7 | classify | devteam | every feature → critical or standard in `.devteam/features.md` |
-| 8 | **approve-plan** | **you** | **pause**: approve the plan and the critical list |
+| 8 | **approve-plan** | **you** | **pause**: approve the plan and the critical list. The only stop; everything below runs unattended |
 | 9 | build-critical | Superpowers | per critical feature: own worktree (`.worktrees/<slug>`, branch `devteam/crit-<slug>`), feature plan, red → green → refactor, verified |
 | 10 | build-standard | OMC | `/oh-my-claudecode:team` for 2+ independent features, `/oh-my-claudecode:autopilot` otherwise, scoped to standard features only |
 | 11 | merge | devteam | critical branches merged into the run branch `devteam/<run-id>`; full suite green; worktrees removed |
 | 12 | review | gstack | `/review` |
 | 13 | qa | gstack | `/qa` |
 | 14 | cso | gstack | `/cso`; high and critical findings fixed (test-first in critical code) |
-| 15 | **approve-ship** | **you** | **pause**: approve shipping |
-| 16 | ship | gstack | `/ship`: merge base, tests, version and changelog, push, PR |
+| 15 | ship | gstack | `/ship`: merge base, tests, version and changelog, push the run branch, open the PR |
 
 `scripts/lib/phases.txt` is the single source for this list. The dry run, the state
 file, the slash command and the smoke test all read it.
+
+### Interactive planning, unattended build
+
+Phases 1–8 are interactive: gstack and OMC ask you about the product and the
+requirements, and you approve the plan. Approving it approves the rest. Phases 9–15 then
+run without questions or approval stops until `/ship` opens the PR. Merging the PR is
+yours.
+
+How the unattended half is kept unattended:
+
+| Would stop | Handled by |
+| --- | --- |
+| Claude Code permission prompts | `scripts/devteam.sh` starts Claude in the `auto` permission mode: routine actions run, risky ones are refused rather than asked. Override with `-- --permission-mode <mode>`. If you start with `/devteam` inside Claude Code, switch to auto mode yourself (Shift+Tab) |
+| gstack questions (`/review`, `/qa`, `/ship`) | The hook runs gstack commands with `GSTACK_SESSION_KIND=spawned`, gstack's no-human mode: it takes the recommended option and never a destructive one |
+| OMC and Superpowers questions | AskUserQuestion is denied with instructions to take the recommended option; Superpowers' plan hand-off is skipped |
+| Claude ending its turn mid-run | A Stop hook sends it back to work while the run is unfinished. If five stops in a row come with no recorded progress, it lets the session stop |
+
+All three are in `.claude/hooks/devteam-autonomy.mjs`. They act only on the session
+driving the run, and only after the plan is approved.
+
+Every decision taken in place of a question goes to `.devteam/artifacts/decisions.md`
+and is linked from the PR.
+
+The run still stops, as **blocked**, when it needs something only a person can give: a
+secret, API key, account or login, a security finding it can't fix, or tests that keep
+failing. The reason is in `scripts/devteam.sh --status` and `.devteam/artifacts/<phase>.md`.
+Provide what's needed, then run `scripts/devteam.sh` to resume. Usage limits, an expired
+login or a closed terminal also end a run; run long jobs inside `tmux` and resume the
+same way.
+
+`/ship` needs the GitHub CLI (`gh`), logged in, to open the PR. The launcher warns when
+it isn't, and the plan approval lists it, so you can fix it before walking away.
 
 ### Critical vs standard
 
@@ -141,15 +172,16 @@ for example OMC `/team` workers, never across tools.
 ### Progress, gates and resuming
 
 `.devteam/state.json` records the run id, run branch, goal hash, every phase's status
-(pending, in_progress, done, skipped, awaiting_approval, approved), notes, artifact
-paths, and every feature's class, status, branch and worktree. Claude updates it only
-through `node scripts/lib/devteam.mjs` (`start`, `done`, `skip`, `gate`, `approve`,
-`feature`, …). That helper refuses to start a phase before the earlier ones finish, so
-the gates are real stops.
+(pending, in_progress, done, skipped, blocked, awaiting_approval, approved), notes,
+artifact paths, and every feature's class, status, branch and worktree. Claude updates
+it only through `node scripts/lib/devteam.mjs` (`start`, `done`, `skip`, `block`, `gate`,
+`approve`, `feature`, …). That helper refuses to start a phase before the earlier ones
+finish, so the gate is a real stop.
 
-- **Stopping**: just stop. `scripts/devteam.sh` or `/devteam` with no argument resumes
-  at the first unfinished phase. An interrupted phase continues from its artifacts and
-  notes; it is not redone.
+- **Stopping**: press Esc, or ask Claude to stop (in the unattended half it records the
+  phase as blocked, "paused by the user"). `scripts/devteam.sh` or `/devteam` with no
+  argument resumes at the first unfinished phase. An interrupted phase continues from
+  its artifacts and notes; it is not redone.
 - **Same goal again**: resumes. **A different goal** while a run is open is refused;
   pass `--new` to archive the open run to `.devteam/archive/<run-id>/` and start fresh.
 - Each phase leaves a summary in `.devteam/artifacts/<phase>.md`; gstack's own
@@ -209,10 +241,11 @@ the smoke test reports them if they break.
 | `WORKFLOW.md` | This document |
 | `templates/goal-template.md` | Goal file template |
 | `.claude/commands/devteam.md` | The `/devteam` slash command (orchestrator instructions) |
-| `.claude/settings.json` | Project plugins, OMC marketplace, gstack Skill gate, agent-teams env |
+| `.claude/settings.json` | Project plugins, OMC marketplace, gstack Skill gate, unattended-run hooks, agent-teams env |
 | `.claude/CLAUDE.md`, `.claude/skills/wiki/` | Written by OMC's `omc-setup --local` |
 | `.claude/omc.jsonc` | OMC project config (keyword triggers, autopilot validation) |
 | `.claude/hooks/check-gstack.cjs` | gstack team-mode gate |
+| `.claude/hooks/devteam-autonomy.mjs` | Keeps the post-approval half of a run unattended |
 | `scripts/setup-prereqs.sh` | Install missing prerequisites, print versions |
 | `scripts/devteam.sh` | Launcher / dry run / resume / status |
 | `scripts/update-agents.sh` | Weekly update with smoke test and rollback |
@@ -232,6 +265,10 @@ the smoke test reports them if they break.
   `scripts/setup-prereqs.sh`, then `cd ~/.claude/skills/gstack && ./setup --team --no-skill-routing`.
 - **`node: libatomic.so.1: cannot open shared object file`**: run
   `scripts/setup-prereqs.sh`, which installs libatomic.
-- **A run is stuck at a gate**: that is by design. Answer the approval question, or run
+- **A run is stuck at the gate**: that is by design. Answer the approval question, or run
   `/devteam` to be asked again.
+- **A run is blocked**: `scripts/devteam.sh --status` shows the phase and what it needs.
+  Provide it, then run `scripts/devteam.sh` to resume.
+- **Permission prompts during the unattended half**: the session isn't in auto mode.
+  Start runs with `scripts/devteam.sh`, or press Shift+Tab until auto mode is shown.
 - **Start over**: `scripts/devteam.sh --new <goal>` archives the current run.
