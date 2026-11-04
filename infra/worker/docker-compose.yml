@@ -1,0 +1,57 @@
+# Worker server: the job runner, the model proxy and the egress proxy. Each sandbox gets its own
+# internal Docker network with only `litellm` and `egress` attached (by the job runner), so it has
+# no route to the internet or to other sandboxes.
+#   sops exec-env ../secrets/worker.enc.env 'docker compose up -d --build'
+name: agent-company-worker
+
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:${LITELLM_VERSION:-main-stable}
+    container_name: litellm          # the job runner attaches this container to each sandbox network
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}           # the only place the real key lives
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      DATABASE_URL: postgresql://agent:${POSTGRES_PASSWORD}@${CONTROL_PRIVATE_IP}:5432/litellm
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_URL:-}
+    volumes: ["./litellm.yaml:/app/config.yaml:ro"]
+    ports: ["${PRIVATE_IP}:4000:4000"]   # the control server mints keys and syncs budgets
+
+  egress:
+    image: ubuntu/squid:${SQUID_VERSION:-6.6-24.04_beta}
+    container_name: egress           # attached to each sandbox network as the only way out
+    restart: unless-stopped
+    volumes: ["./squid.conf:/etc/squid/squid.conf:ro"]
+
+  agents-worker:
+    image: agent-company/platform:latest
+    build: {context: ../.., dockerfile: infra/platform.Dockerfile}
+    restart: unless-stopped
+    command: ["python", "-m", "orchestrator.worker"]
+    environment:
+      DATABASE_URL: postgresql://agent:${POSTGRES_PASSWORD}@${CONTROL_PRIVATE_IP}:5432/agent_company
+      GITHUB_APP_IDS: ${GITHUB_APP_IDS}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
+      SLACK_CHANNEL: ${SLACK_CHANNEL}
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      SANDBOX_MODEL_BASE_URL: ${SANDBOX_MODEL_BASE_URL:-http://litellm:4000/anthropic}
+      SANDBOX_EGRESS_PROXY: http://egress:3128
+      SANDBOX_NETWORK: per-job
+      SANDBOX_PROXY_CONTAINERS: '{"litellm": "litellm", "egress": "egress"}'
+      SANDBOX_RUNTIME: ${SANDBOX_RUNTIME:-runsc}
+      SANDBOX_DISK_QUOTA: ${SANDBOX_DISK_QUOTA:-}
+      MAX_SANDBOXES: ${MAX_SANDBOXES:-4}
+      WORKER_ID: ${WORKER_ID:-worker-1}
+      TEAM_DAILY_CEILING_USD: ${TEAM_DAILY_CEILING_USD:-250}
+      TIMEZONE: ${TIMEZONE:-America/Chicago}
+      LANGFUSE_URL: ${LANGFUSE_URL:-}
+    volumes:
+      # The job runner starts sibling sandbox containers. This socket is root-equivalent on the
+      # worker host; this container runs only our code, never agent code.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${GITHUB_APP_KEY_DIR:-/etc/agent-company/github-apps}:/run/secrets/github-apps:ro
+    depends_on: [litellm, egress]

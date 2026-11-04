@@ -1,0 +1,25 @@
+# Model proxy. Sandboxes use the Anthropic pass-through route (ANTHROPIC_BASE_URL=.../anthropic),
+# so Claude Code's requests reach Anthropic unchanged; per-run virtual keys and per-role team
+# budgets still apply. The model list serves ask_model() on the control server.
+model_list:
+  - model_name: claude-opus-5-5
+    litellm_params: {model: anthropic/claude-opus-5-5, api_key: os.environ/ANTHROPIC_API_KEY}
+  - model_name: claude-sonnet-5-5
+    litellm_params: {model: anthropic/claude-sonnet-5-5, api_key: os.environ/ANTHROPIC_API_KEY}
+  - model_name: claude-haiku-5-5
+    litellm_params: {model: anthropic/claude-haiku-5-5, api_key: os.environ/ANTHROPIC_API_KEY}
+
+router_settings:
+  num_retries: 3
+  retry_after: 10        # 429 / 5xx backoff before the run itself fails
+
+litellm_settings:
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
+  # Global hard ceiling for the whole proxy. Keep in step with TEAM_DAILY_CEILING_USD.
+  max_budget: 250
+  budget_duration: 1d
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
