@@ -1,8 +1,0 @@
-# Secrets are committed only in encrypted form (infra/secrets/*.enc.env) and decrypted on the
-# servers. Replace the recipients with your age public keys: one per server, one for you.
-creation_rules:
-  - path_regex: infra/secrets/.*\.enc\.env$
-    age: >-
-      age1REPLACE_WITH_CONTROL_SERVER_KEY,
-      age1REPLACE_WITH_WORKER_SERVER_KEY,
-      age1REPLACE_WITH_YOUR_ADMIN_KEY
