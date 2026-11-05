@@ -1,9 +1,9 @@
-# AI Software Team
+# Built Diffrent
 
 **One goal in, a reviewed, tested and security-audited pull request out.**
 
-AI Software Team is a [Claude Code](https://claude.com/claude-code) workspace that runs
-three open-source agent toolkits as a single software team:
+Built Diffrent is a [Claude Code](https://claude.com/claude-code) workspace that runs
+three open-source agent toolkits as a single AI software team:
 
 - [gstack](https://github.com/garrytan/gstack) reviews the product, the plan, the code,
   and the security, then ships.

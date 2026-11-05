@@ -1,4 +1,4 @@
-# AI dev team workflow
+# Built Diffrent: AI dev team workflow
 
 This repo is a Claude Code workspace that runs three tools as one team:
 

@@ -1,4 +1,4 @@
-# AI dev team workspace
+# Built Diffrent: AI dev team workspace
 
 Three tools are installed and enabled for this project: **gstack**, **oh-my-claudecode
 (OMC)** and **Superpowers**. Each owns a different part of the work. These rules take
